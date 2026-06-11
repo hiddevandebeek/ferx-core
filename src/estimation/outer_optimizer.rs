@@ -1,5 +1,5 @@
 use crate::estimation::gauss_newton::subject_nll_pop_grad;
-use crate::estimation::inner_optimizer::run_inner_loop_warm;
+use crate::estimation::inner_optimizer::{find_ebe, run_inner_loop_warm};
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::stats::likelihood::{foce_population_nll, foce_population_nll_iov};
 use crate::types::*;
@@ -2268,25 +2268,143 @@ pub(crate) fn compute_covariance(
         // 2·n_free gradient evaluations vs ~2·n_free² scalar-OFV evaluations, with
         // no 4-point cross-stencil cancellation (#129). `grad` reconverges the EBEs
         // at each perturbed point, so the curvature includes the EBE response.
-        for &k in &free_idx {
-            let hk = eps * (1.0 + x_hat[k].abs());
-            let mut x_p = x_hat.to_vec();
-            let mut x_m = x_hat.to_vec();
-            x_p[k] += hk;
-            x_m[k] -= hk;
-            let g_p = grad(&x_p);
-            let g_m = grad(&x_m);
-            for &j in &free_idx {
-                let h_jk = (g_p[j] - g_m[j]) / (2.0 * hk);
-                if h_jk.is_finite() {
-                    hess[(j, k)] = h_jk;
-                } else if j == k {
-                    fd_diag_nan.insert(k);
-                } else {
-                    fd_offdiag_nan.insert(k);
-                    fd_offdiag_nan.insert(j);
+        //
+        // TEMP (#256 A/B): env-gated path selection + timing to measure the
+        // flattened work-list against the current serial outer loop.
+        //   FERX_COV_TIMING=1   prints the outer-loop wall (path-labelled).
+        //   FERX_COV_FLATTEN=1  uses the flattened path instead of the serial one.
+        // Remove before merge.
+        let cov_timing = std::env::var("FERX_COV_TIMING").is_ok();
+        let cov_flatten = std::env::var("FERX_COV_FLATTEN").is_ok();
+        let t_outer = std::time::Instant::now();
+
+        // Serial population gradient at a perturbed point — bit-identical to the
+        // `grad` closure above, but every per-subject step runs in subject-index
+        // order with no inner `par_iter`, so it is safe to call from an outer
+        // `par_iter` over points without nesting. The reduction order matches
+        // `ad_population_gradient` (subject-index sum) and `omega_prior_gradient`
+        // (scatter matrix in subject order), so the result is bit-for-bit equal.
+        let n_subj_cov = population.subjects.len();
+        let serial_grad = |xv: &[f64]| -> Vec<f64> {
+            let params = unpack_params(xv, template);
+            let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+            let mut ehs: Vec<DVector<f64>> = Vec::with_capacity(n_subj_cov);
+            let mut hms: Vec<DMatrix<f64>> = Vec::with_capacity(n_subj_cov);
+            let mut kaps: Vec<Vec<DVector<f64>>> = Vec::with_capacity(n_subj_cov);
+            for i in 0..n_subj_cov {
+                let ebe = find_ebe(
+                    model,
+                    &population.subjects[i],
+                    &params,
+                    options.inner_maxiter,
+                    options.inner_tol,
+                    Some(eta_hats[i].as_slice()),
+                    Some(&mu_k),
+                );
+                ehs.push(ebe.eta);
+                hms.push(ebe.h_matrix);
+                kaps.push(ebe.kappas);
+            }
+            let np = xv.len();
+            let per_subj: Vec<Vec<f64>> = (0..n_subj_cov)
+                .map(|i| {
+                    subject_nll_pop_grad(
+                        xv,
+                        template,
+                        model,
+                        population,
+                        i,
+                        &ehs[i],
+                        &hms[i],
+                        kaps[i].as_slice(),
+                        &bounds,
+                        options,
+                    )
+                    .1
+                })
+                .collect();
+            let mut g: Vec<f64> = (0..np)
+                .map(|kk| per_subj.iter().map(|gi| gi[kk]).sum::<f64>() * 2.0)
+                .collect();
+            if !options.interaction {
+                let n_theta = template.theta.len();
+                for (kk, gp) in omega_prior_gradient(&ehs, &params).into_iter().enumerate() {
+                    g[n_theta + kk] += gp;
                 }
             }
+            g
+        };
+
+        if cov_flatten {
+            // #256: single `par_iter` over the 2·n_free perturbed points. Each
+            // point runs its subjects serially inside `serial_grad`, so this is
+            // one flat work-list (no nested parallelism) at point granularity.
+            // Parallel width = 2·n_free, which saturates the pool even when
+            // n_subj < n_cores (the regime the per-subject inner `par_iter`
+            // under-utilises).
+            let mut points: Vec<(usize, f64, Vec<f64>)> = Vec::with_capacity(2 * free_idx.len());
+            for &k in &free_idx {
+                let hk = eps * (1.0 + x_hat[k].abs());
+                let mut x_p = x_hat.to_vec();
+                let mut x_m = x_hat.to_vec();
+                x_p[k] += hk;
+                x_m[k] -= hk;
+                points.push((k, hk, x_p));
+                points.push((k, hk, x_m));
+            }
+            let point_grads: Vec<Vec<f64>> = points
+                .par_iter()
+                .map(|(_, _, xv)| serial_grad(xv))
+                .collect();
+            for (pair, &k) in free_idx.iter().enumerate() {
+                let g_p = &point_grads[2 * pair];
+                let g_m = &point_grads[2 * pair + 1];
+                let hk = points[2 * pair].1;
+                for &j in &free_idx {
+                    let h_jk = (g_p[j] - g_m[j]) / (2.0 * hk);
+                    if h_jk.is_finite() {
+                        hess[(j, k)] = h_jk;
+                    } else if j == k {
+                        fd_diag_nan.insert(k);
+                    } else {
+                        fd_offdiag_nan.insert(k);
+                        fd_offdiag_nan.insert(j);
+                    }
+                }
+            }
+        } else {
+            for &k in &free_idx {
+                let hk = eps * (1.0 + x_hat[k].abs());
+                let mut x_p = x_hat.to_vec();
+                let mut x_m = x_hat.to_vec();
+                x_p[k] += hk;
+                x_m[k] -= hk;
+                let g_p = grad(&x_p);
+                let g_m = grad(&x_m);
+                for &j in &free_idx {
+                    let h_jk = (g_p[j] - g_m[j]) / (2.0 * hk);
+                    if h_jk.is_finite() {
+                        hess[(j, k)] = h_jk;
+                    } else if j == k {
+                        fd_diag_nan.insert(k);
+                    } else {
+                        fd_offdiag_nan.insert(k);
+                        fd_offdiag_nan.insert(j);
+                    }
+                }
+            }
+        }
+        if cov_timing {
+            eprintln!(
+                "[FERX_COV_TIMING] non-IOV path={} n_free={} n_subj={} n_cores={} \
+                 outer_loop_wall={:.4}s grad_calls={}",
+                if cov_flatten { "flatten" } else { "serial" },
+                free_idx.len(),
+                population.subjects.len(),
+                rayon::current_num_threads(),
+                t_outer.elapsed().as_secs_f64(),
+                2 * free_idx.len(),
+            );
         }
         // Symmetrise: each column is differenced independently, so H[j,k] and
         // H[k,j] can differ slightly; average before inversion.
