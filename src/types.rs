@@ -2800,6 +2800,14 @@ impl CompiledModel {
     /// scaling and residual-eta column apply unchanged); only the **non-IOV** ODE variant
     /// stays on FD pending its own regression coverage — hence the `n_kappa == 0` guard.
     ///
+    /// The non-IOV ODE outer θ-block is **not** a free gate flip: the inner η-gradient
+    /// matches FD, but the censored × residual-eta × θ second-order coupling that the outer
+    /// `prepare` assembles from the **closed-form** Dual2 provider is not reproduced by the
+    /// ODE Dual2 walk's sensitivities (an FD-comparison probe gave a ~3% TVCL gradient error
+    /// on `ONECPT_ODE_M3_RUV` — Audit ③ "flipping the gate would produce a WRONG gradient",
+    /// not a #547-style coverage gap). Closing it needs real second-order work, not just a
+    /// gate change — tracked as the last open `iiv_on_ruv` cell in #486.
+    ///
     /// **This is NOT the single source of truth for the full routing** — the decision
     /// is spread across several predicates that must move together, so a future scope
     /// change has to touch all the relevant ones in lockstep or the inner and outer
@@ -2823,7 +2831,8 @@ impl CompiledModel {
             && matches!(self.bloq_method, BloqMethod::M3)
             && self.ode_spec.is_some()
             // The IOV variant (`n_kappa > 0`) is analytic + tested as of #486; only the
-            // non-IOV ODE M3 + `iiv_on_ruv` combo remains on FD.
+            // non-IOV ODE M3 + `iiv_on_ruv` combo remains on FD (the outer θ-block needs
+            // real second-order work — see the doc above).
             && self.n_kappa == 0
     }
 
